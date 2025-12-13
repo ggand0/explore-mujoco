@@ -1,3 +1,8 @@
+CLAUDE.md
+**/*.mp4
+devlogs/
+runs/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
