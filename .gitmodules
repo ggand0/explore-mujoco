@@ -1,0 +1,4 @@
+[submodule "SO-ARM100"]
+	path = SO-ARM100
+	url = git@github.com:ggand0/SO-ARM100.git
+	branch = feat/rl-training-scenes
