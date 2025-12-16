@@ -22,11 +22,12 @@ class PlotLearningCurveCallback(BaseCallback):
         run_dir: str | Path,
         save_freq: int = 50000,
         verbose: int = 0,
+        resume_step: int = 0,
     ):
         super().__init__(verbose)
         self.run_dir = Path(run_dir)
         self.save_freq = save_freq
-        self._last_plot_step = 0
+        self._last_plot_step = resume_step
 
     def _on_step(self) -> bool:
         # Plot at save_freq intervals

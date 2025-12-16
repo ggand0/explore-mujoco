@@ -109,28 +109,6 @@ def main():
             training=False,
         )
 
-    # Callbacks
-    checkpoint_callback = CheckpointCallback(
-        save_freq=train_cfg["save_freq"],
-        save_path=str(output_dir / "checkpoints"),
-        name_prefix="sac_lift",
-    )
-
-    eval_callback = EvalCallback(
-        eval_env,
-        best_model_save_path=str(output_dir / "best_model"),
-        log_path=str(output_dir / "eval_logs"),
-        eval_freq=train_cfg["eval_freq"],
-        deterministic=True,
-        render=False,
-    )
-
-    plot_callback = PlotLearningCurveCallback(
-        run_dir=output_dir,
-        save_freq=train_cfg["save_freq"],
-        verbose=1,
-    )
-
     # Create or load model
     resume_step = 0
     if args.resume:
@@ -174,6 +152,29 @@ def main():
             device=device,
             tensorboard_log=str(output_dir / "tensorboard"),
         )
+
+    # Callbacks (created after model loading so resume_step is known)
+    checkpoint_callback = CheckpointCallback(
+        save_freq=train_cfg["save_freq"],
+        save_path=str(output_dir / "checkpoints"),
+        name_prefix="sac_lift",
+    )
+
+    eval_callback = EvalCallback(
+        eval_env,
+        best_model_save_path=str(output_dir / "best_model"),
+        log_path=str(output_dir / "eval_logs"),
+        eval_freq=train_cfg["eval_freq"],
+        deterministic=True,
+        render=False,
+    )
+
+    plot_callback = PlotLearningCurveCallback(
+        run_dir=output_dir,
+        save_freq=train_cfg["save_freq"],
+        verbose=1,
+        resume_step=resume_step,
+    )
 
     # Use CLI timesteps if provided, otherwise use config
     timesteps = args.timesteps if args.timesteps is not None else train_cfg["timesteps"]
