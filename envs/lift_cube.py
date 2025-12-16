@@ -126,14 +126,19 @@ class LiftCubeCartesianEnv(gym.Env):
         return self.data.qpos[gripper_qpos_addr]
 
     def _check_cube_contacts(self) -> tuple[bool, bool]:
-        """Check if cube contacts static gripper and moving jaw separately."""
+        """Check if cube contacts static gripper and moving jaw separately.
+
+        Uses hardcoded geom ID ranges based on XML loading order:
+        - Gripper body geoms: IDs 25-28 (static gripper part)
+        - Moving jaw geoms: IDs 29-30 (moving jaw mesh)
+        """
         cube_geom_id = mujoco.mj_name2id(
             self.model, mujoco.mjtObj.mjOBJ_GEOM, "cube_geom"
         )
-        # Geoms 25-28: static gripper body
-        # Geoms 29-30: moving jaw
-        static_gripper_geoms = set(range(25, 29))
-        moving_jaw_geoms = set(range(29, 31))
+        # Gripper body geoms (static part)
+        gripper_geom_ids = set(range(25, 29))
+        # Moving jaw geoms
+        jaw_geom_ids = set(range(29, 31))
 
         has_gripper_contact = False
         has_jaw_contact = False
@@ -149,9 +154,9 @@ class LiftCubeCartesianEnv(gym.Env):
                 other_geom = geom1
 
             if other_geom is not None:
-                if other_geom in static_gripper_geoms:
+                if other_geom in gripper_geom_ids:
                     has_gripper_contact = True
-                if other_geom in moving_jaw_geoms:
+                if other_geom in jaw_geom_ids:
                     has_jaw_contact = True
 
         return has_gripper_contact, has_jaw_contact
@@ -275,7 +280,8 @@ class LiftCubeCartesianEnv(gym.Env):
         if self.reward_type == "sparse":
             return 0.0 if info["is_success"] else -1.0
         else:
-            # Dense reward with continuous lift gradient
+            # V7: V1 reward + push-down penalty
+            # V1 achieved grasping, just couldn't lift due to push-down exploit
             reward = 0.0
             cube_z = info["cube_z"]
 
@@ -284,19 +290,16 @@ class LiftCubeCartesianEnv(gym.Env):
             reach_reward = 1.0 - np.tanh(10.0 * gripper_to_cube)
             reward += reach_reward
 
-            # Small reward for any cube height above baseline (encourages exploration)
-            # Even without grasp, launching the cube gives a small signal
-            lift_baseline = max(0, (cube_z - 0.01) * 10.0)
-            reward += lift_baseline
+            # Push-down penalty - penalize cube below baseline (z=0.01)
+            if cube_z < 0.01:
+                push_penalty = (0.01 - cube_z) * 50.0
+                reward -= push_penalty
 
-            # V4: No standalone grasp bonus - only reward grasping when lifting
-            # This removes the incentive to grasp and push down (z=0.007)
-            if info["is_grasping"] and cube_z > 0.01:
-                reward += 0.25  # Grasp bonus only when elevated
-                # Additional lift reward when grasping (4x stronger than baseline)
-                reward += (cube_z - 0.01) * 40.0
+            # Grasp bonus (V1 style - always reward grasping)
+            if info["is_grasping"]:
+                reward += 0.25
 
-            # Binary lift bonus (same as v1)
+            # Binary lift bonus
             if cube_z > 0.02:
                 reward += 1.0
 
