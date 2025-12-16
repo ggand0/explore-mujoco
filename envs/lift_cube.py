@@ -43,6 +43,7 @@ class LiftCubeCartesianEnv(gym.Env):
         lift_height: float = 0.08,
         hold_steps: int = 10,
         reward_type: str = "dense",
+        reward_version: str = "v7",
     ):
         super().__init__()
 
@@ -52,6 +53,7 @@ class LiftCubeCartesianEnv(gym.Env):
         self.lift_height = lift_height
         self.hold_steps = hold_steps
         self.reward_type = reward_type
+        self.reward_version = reward_version
         self._step_count = 0
         self._hold_count = 0
 
@@ -174,8 +176,10 @@ class LiftCubeCartesianEnv(gym.Env):
     def _get_info(self) -> dict[str, Any]:
         gripper_pos = self.ik.get_ee_position()
         cube_pos = self.data.sensor("cube_pos").data.copy()
+        grasp_pos = self.data.sensor("grasp_pos").data.copy()
 
-        gripper_to_cube = np.linalg.norm(gripper_pos - cube_pos)
+        # Use grasp_pos (between fingers) for reach reward, not gripper_pos (TCP)
+        gripper_to_cube = np.linalg.norm(grasp_pos - cube_pos)
         cube_z = cube_pos[2]
         is_grasping = self._is_grasping()
         is_lifted = is_grasping and cube_z > self.lift_height
@@ -279,35 +283,216 @@ class LiftCubeCartesianEnv(gym.Env):
     def _compute_reward(self, info: dict[str, Any]) -> float:
         if self.reward_type == "sparse":
             return 0.0 if info["is_success"] else -1.0
-        else:
-            # V7: V1 reward + push-down penalty
-            # V1 achieved grasping, just couldn't lift due to push-down exploit
-            reward = 0.0
-            cube_z = info["cube_z"]
 
-            # Reach: encourage gripper to approach cube (tanh for smooth gradient)
-            gripper_to_cube = info["gripper_to_cube"]
-            reach_reward = 1.0 - np.tanh(10.0 * gripper_to_cube)
-            reward += reach_reward
+        # Dispatch to version-specific reward function
+        reward_fn = getattr(self, f"_reward_{self.reward_version}", None)
+        if reward_fn is None:
+            raise ValueError(f"Unknown reward version: {self.reward_version}")
+        return reward_fn(info)
 
-            # Push-down penalty - penalize cube below baseline (z=0.01)
-            if cube_z < 0.01:
-                push_penalty = (0.01 - cube_z) * 50.0
-                reward -= push_penalty
+    def _reward_v1(self, info: dict[str, Any]) -> float:
+        """V1: Reach + grasp bonus + binary lift. Original reward that achieved grasping
+        (via physics exploit with soft contacts)."""
+        reward = 0.0
+        cube_z = info["cube_z"]
+        gripper_to_cube = info["gripper_to_cube"]
 
-            # Grasp bonus (V1 style - always reward grasping)
-            if info["is_grasping"]:
-                reward += 0.25
+        # Reach reward
+        reach_reward = 1.0 - np.tanh(10.0 * gripper_to_cube)
+        reward += reach_reward
 
-            # Binary lift bonus
-            if cube_z > 0.02:
-                reward += 1.0
+        # Grasp bonus (always)
+        if info["is_grasping"]:
+            reward += 0.25
 
-            # Success bonus
-            if info["is_success"]:
-                reward += 10.0
+        # Binary lift bonus
+        if cube_z > 0.02:
+            reward += 1.0
 
-            return reward
+        # Success bonus
+        if info["is_success"]:
+            reward += 10.0
+
+        return reward
+
+    def _reward_v2(self, info: dict[str, Any]) -> float:
+        """V2: Reach + continuous lift (no grasp condition). Disrupted grasping entirely."""
+        reward = 0.0
+        cube_z = info["cube_z"]
+        gripper_to_cube = info["gripper_to_cube"]
+
+        # Reach reward
+        reach_reward = 1.0 - np.tanh(10.0 * gripper_to_cube)
+        reward += reach_reward
+
+        # Grasp bonus (stronger than V1)
+        if info["is_grasping"]:
+            reward += 0.5
+
+        # Continuous lift (unconditional - this is what broke it)
+        reward += max(0, (cube_z - 0.01) * 50.0)
+
+        # Target height bonus
+        if cube_z > self.lift_height:
+            reward += 2.0
+
+        # Success bonus
+        if info["is_success"]:
+            reward += 10.0
+
+        return reward
+
+    def _reward_v3(self, info: dict[str, Any]) -> float:
+        """V3: V1 + continuous lift gradient. Destabilized training."""
+        reward = 0.0
+        cube_z = info["cube_z"]
+        gripper_to_cube = info["gripper_to_cube"]
+
+        # Reach reward
+        reach_reward = 1.0 - np.tanh(10.0 * gripper_to_cube)
+        reward += reach_reward
+
+        # Continuous lift baseline (without grasp)
+        lift_baseline = max(0, (cube_z - 0.01) * 10.0)
+        reward += lift_baseline
+
+        # Grasp bonus (always)
+        if info["is_grasping"]:
+            reward += 0.25
+            # Stronger lift reward when grasping
+            reward += (cube_z - 0.01) * 40.0
+
+        # Binary lift bonus
+        if cube_z > 0.02:
+            reward += 1.0
+
+        # Success bonus
+        if info["is_success"]:
+            reward += 10.0
+
+        return reward
+
+    def _reward_v4(self, info: dict[str, Any]) -> float:
+        """V4: V3 but grasp bonus only when elevated. Never closes gripper."""
+        reward = 0.0
+        cube_z = info["cube_z"]
+        gripper_to_cube = info["gripper_to_cube"]
+
+        # Reach reward
+        reach_reward = 1.0 - np.tanh(10.0 * gripper_to_cube)
+        reward += reach_reward
+
+        # Continuous lift baseline
+        lift_baseline = max(0, (cube_z - 0.01) * 10.0)
+        reward += lift_baseline
+
+        # Grasp bonus only when elevated
+        if info["is_grasping"] and cube_z > 0.01:
+            reward += 0.25
+            reward += (cube_z - 0.01) * 40.0
+
+        # Binary lift bonus
+        if cube_z > 0.02:
+            reward += 1.0
+
+        # Success bonus
+        if info["is_success"]:
+            reward += 10.0
+
+        return reward
+
+    def _reward_v5(self, info: dict[str, Any]) -> float:
+        """V5: V3 + push-down penalty. Nudge exploit - tilts cube."""
+        reward = 0.0
+        cube_z = info["cube_z"]
+        gripper_to_cube = info["gripper_to_cube"]
+
+        # Reach reward
+        reach_reward = 1.0 - np.tanh(10.0 * gripper_to_cube)
+        reward += reach_reward
+
+        # Push-down penalty
+        if cube_z < 0.01:
+            push_penalty = (0.01 - cube_z) * 50.0
+            reward -= push_penalty
+
+        # Continuous lift baseline
+        lift_baseline = max(0, (cube_z - 0.01) * 10.0)
+        reward += lift_baseline
+
+        # Grasp bonus (always)
+        if info["is_grasping"]:
+            reward += 0.25
+            reward += (cube_z - 0.01) * 40.0
+
+        # Binary lift bonus
+        if cube_z > 0.02:
+            reward += 1.0
+
+        # Success bonus
+        if info["is_success"]:
+            reward += 10.0
+
+        return reward
+
+    def _reward_v6(self, info: dict[str, Any]) -> float:
+        """V6: V5 without lift_baseline. Safe hover far away."""
+        reward = 0.0
+        cube_z = info["cube_z"]
+        gripper_to_cube = info["gripper_to_cube"]
+
+        # Reach reward
+        reach_reward = 1.0 - np.tanh(10.0 * gripper_to_cube)
+        reward += reach_reward
+
+        # Push-down penalty
+        if cube_z < 0.01:
+            push_penalty = (0.01 - cube_z) * 50.0
+            reward -= push_penalty
+
+        # Grasp bonus (always)
+        if info["is_grasping"]:
+            reward += 0.25
+            reward += (cube_z - 0.01) * 40.0
+
+        # Binary lift bonus
+        if cube_z > 0.02:
+            reward += 1.0
+
+        # Success bonus
+        if info["is_success"]:
+            reward += 10.0
+
+        return reward
+
+    def _reward_v7(self, info: dict[str, Any]) -> float:
+        """V7: V1 + push-down penalty. Prevents agent from pushing cube into table."""
+        reward = 0.0
+        cube_z = info["cube_z"]
+        gripper_to_cube = info["gripper_to_cube"]
+
+        # Reach reward
+        reach_reward = 1.0 - np.tanh(10.0 * gripper_to_cube)
+        reward += reach_reward
+
+        # Push-down penalty
+        if cube_z < 0.01:
+            push_penalty = (0.01 - cube_z) * 50.0
+            reward -= push_penalty
+
+        # Grasp bonus (always)
+        if info["is_grasping"]:
+            reward += 0.25
+
+        # Binary lift bonus
+        if cube_z > 0.02:
+            reward += 1.0
+
+        # Success bonus
+        if info["is_success"]:
+            reward += 10.0
+
+        return reward
 
     def render(self) -> np.ndarray | None:
         if self.render_mode == "rgb_array":
