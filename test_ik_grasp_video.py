@@ -128,12 +128,15 @@ print("\n--- Step 3: Close ---")
 gripper_joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "gripper")
 gripper_qpos_addr = model.jnt_qposadr[gripper_joint_id]
 
-for step in range(300):
+for step in range(800):
+    t = min(step / 600, 1.0)  # Slower gripper close
+    gripper_action = 1.0 - 2.0 * t
+
     offset = get_tcp_to_finger_offset()
     finger_target = np.array([cube_x, cube_y, cube_z])
     tcp_target = finger_target + offset
 
-    ctrl = ik.step_toward_target(tcp_target, gripper_action=-1.0, gain=0.5, locked_joints=[3, 4])
+    ctrl = ik.step_toward_target(tcp_target, gripper_action=gripper_action, gain=0.5, locked_joints=[3, 4])
     ctrl[3] = 1.65
     ctrl[4] = np.pi / 2
     data.ctrl[:] = ctrl
