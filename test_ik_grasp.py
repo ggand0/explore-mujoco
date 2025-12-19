@@ -29,16 +29,20 @@ mujoco.mj_forward(model, data)
 
 ik = IKController(model, data)
 
-# Calculate finger midpoint offset from TCP
-finger_27 = data.geom_xpos[27].copy()
-finger_29 = data.geom_xpos[29].copy()
-finger_mid_y = (finger_27[1] + finger_29[1]) / 2
-tcp_y = ik.get_ee_position()[1]
-y_offset = tcp_y - finger_mid_y  # How much to add to target Y to center fingers on cube
+# Calculate finger midpoint offset from TCP (both Y and Z)
+# Use geoms 28 and 30 (collision geoms), not 27 and 29 (visual-only, no collision)
+finger_28 = data.geom_xpos[28].copy()
+finger_30 = data.geom_xpos[30].copy()
+finger_mid = (finger_28 + finger_30) / 2
+tcp_pos = ik.get_ee_position()
+# Offset: how much to add to target to get fingers where we want
+y_offset = tcp_pos[1] - finger_mid[1]
+z_offset = tcp_pos[2] - finger_mid[2]
 
 print("=== IK Grasp Test with wrist_roll=pi/2 ===")
 print(f"Cube at: ({cube_x}, {cube_y}, 0.015)")
-print(f"Finger midpoint Y: {finger_mid_y:.4f}, TCP Y: {tcp_y:.4f}, offset: {y_offset:.4f}")
+print(f"Finger mid: {finger_mid}, TCP: {tcp_pos}")
+print(f"Y offset: {y_offset:.4f}, Z offset: {z_offset:.4f}")
 
 def get_contacts():
     contacts = []
@@ -50,18 +54,13 @@ def get_contacts():
     return contacts
 
 with mujoco.viewer.launch_passive(model, data) as viewer:
-    # Step 1: Move to approach position (offset Y so fingers straddle cube)
-    # Also recalculate Y offset dynamically as arm moves
+    # Step 1: Move to approach position
     print("\n--- Step 1: Approach ---")
-    for step in range(100):
-        # Recalculate offset each step
-        f27 = data.geom_xpos[27]
-        f29 = data.geom_xpos[29]
-        cur_finger_mid_y = (f27[1] + f29[1]) / 2
-        cur_tcp_y = ik.get_ee_position()[1]
-        cur_y_offset = cur_tcp_y - cur_finger_mid_y
-
-        approach_pos = np.array([cube_x - 0.05, cube_y + cur_y_offset, 0.025])
+    cube_z = 0.015
+    # Use fixed offset calculated at start
+    approach_pos = np.array([cube_x - 0.05, cube_y + y_offset, cube_z + z_offset])
+    print(f"Approach target: {approach_pos}")
+    for step in range(300):
         ctrl = ik.step_toward_target(approach_pos, gripper_action=1.0, gain=0.5)
         ctrl[4] = np.pi / 2
         data.ctrl[:] = ctrl
@@ -69,21 +68,15 @@ with mujoco.viewer.launch_passive(model, data) as viewer:
         viewer.sync()
         time.sleep(0.01)
 
-    print(f"TCP: {ik.get_ee_position()}")
-    print(f"Finger 27: {data.geom_xpos[27]}")
-    print(f"Finger 29: {data.geom_xpos[29]}")
-    print(f"Finger mid Y: {(data.geom_xpos[27][1] + data.geom_xpos[29][1])/2:.4f}, Cube Y: {cube_y}")
+        if step % 50 == 0:
+            tcp = ik.get_ee_position()
+            print(f"  step {step}: tcp={tcp}")
 
-    # Step 2: Move forward to cube (dynamic Y offset)
+    # Step 2: Move forward to cube
     print("\n--- Step 2: Forward ---")
-    for step in range(100):
-        f27 = data.geom_xpos[27]
-        f29 = data.geom_xpos[29]
-        cur_finger_mid_y = (f27[1] + f29[1]) / 2
-        cur_tcp_y = ik.get_ee_position()[1]
-        cur_y_offset = cur_tcp_y - cur_finger_mid_y
-
-        grasp_pos = np.array([cube_x, cube_y + cur_y_offset, 0.025])
+    grasp_pos = np.array([cube_x, cube_y + y_offset, cube_z + z_offset])
+    print(f"Grasp target: {grasp_pos}")
+    for step in range(300):
         ctrl = ik.step_toward_target(grasp_pos, gripper_action=1.0, gain=0.5)
         ctrl[4] = np.pi / 2
         data.ctrl[:] = ctrl
