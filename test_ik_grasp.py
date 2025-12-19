@@ -1,4 +1,4 @@
-"""Test IK-based grasp with wrist_roll pre-rotation."""
+"""Test IK-based grasp with orientation control."""
 import mujoco
 import mujoco.viewer
 import numpy as np
@@ -29,20 +29,26 @@ mujoco.mj_forward(model, data)
 
 ik = IKController(model, data)
 
-# Calculate finger midpoint offset from TCP (both Y and Z)
-# Use geoms 28 and 30 (collision geoms), not 27 and 29 (visual-only, no collision)
-finger_28 = data.geom_xpos[28].copy()
-finger_30 = data.geom_xpos[30].copy()
-finger_mid = (finger_28 + finger_30) / 2
-tcp_pos = ik.get_ee_position()
-# Offset: how much to add to target to get fingers where we want
-y_offset = tcp_pos[1] - finger_mid[1]
-z_offset = tcp_pos[2] - finger_mid[2]
+# Target orientation: gripper pointing down with fingers horizontal
+# Rotation: 90° around Y (pitch down) then 90° around Z (roll for horizontal fingers)
+# As quaternion (w, x, y, z):
+# Pitch -90° around Y: (cos(-45°), 0, sin(-45°), 0) = (0.707, 0, -0.707, 0)
+# Then roll 90° around local Z
+# Combined: gripper Z pointing down, fingers along world Y
+def euler_to_quat(roll, pitch, yaw):
+    """Convert euler angles (in radians) to quaternion (w, x, y, z)."""
+    cr, cp, cy = np.cos(roll/2), np.cos(pitch/2), np.cos(yaw/2)
+    sr, sp, sy = np.sin(roll/2), np.sin(pitch/2), np.sin(yaw/2)
+    w = cr * cp * cy + sr * sp * sy
+    x = sr * cp * cy - cr * sp * sy
+    y = cr * sp * cy + sr * cp * sy
+    z = cr * cp * sy - sr * sp * cy
+    return np.array([w, x, y, z])
 
-print("=== IK Grasp Test with wrist_roll=pi/2 ===")
-print(f"Cube at: ({cube_x}, {cube_y}, 0.015)")
-print(f"Finger mid: {finger_mid}, TCP: {tcp_pos}")
-print(f"Y offset: {y_offset:.4f}, Z offset: {z_offset:.4f}")
+# Gripper pointing down: pitch = -90° (or +90° depending on convention)
+# With fingers horizontal: roll = 90°
+target_quat = euler_to_quat(np.pi/2, np.pi/2, 0)  # roll=90°, pitch=90°
+print(f"Target quaternion: {target_quat}")
 
 def get_contacts():
     contacts = []
@@ -53,16 +59,24 @@ def get_contacts():
             contacts.append(other)
     return contacts
 
+print("=== IK Grasp Test with Orientation Control ===")
+print(f"Cube at: ({cube_x}, {cube_y}, 0.015)")
+
 with mujoco.viewer.launch_passive(model, data) as viewer:
-    # Step 1: Move to approach position
+    # Step 1: Move to approach position with orientation
     print("\n--- Step 1: Approach ---")
     cube_z = 0.015
-    # Use fixed offset calculated at start
-    approach_pos = np.array([cube_x - 0.05, cube_y + y_offset, cube_z + z_offset])
+    approach_pos = np.array([cube_x - 0.05, cube_y, cube_z])
     print(f"Approach target: {approach_pos}")
+
     for step in range(300):
-        ctrl = ik.step_toward_target(approach_pos, gripper_action=1.0, gain=0.5)
-        ctrl[4] = np.pi / 2
+        ctrl = ik.step_toward_target(
+            approach_pos,
+            gripper_action=1.0,
+            gain=0.5,
+            target_quat=target_quat,
+            orientation_weight=0.5
+        )
         data.ctrl[:] = ctrl
         mujoco.mj_step(model, data)
         viewer.sync()
@@ -70,31 +84,52 @@ with mujoco.viewer.launch_passive(model, data) as viewer:
 
         if step % 50 == 0:
             tcp = ik.get_ee_position()
-            print(f"  step {step}: tcp={tcp}")
+            f28 = data.geom_xpos[28]
+            f30 = data.geom_xpos[30]
+            finger_mid = (f28 + f30) / 2
+            print(f"  step {step}: tcp Z={tcp[2]:.4f}, finger_mid Z={finger_mid[2]:.4f}")
 
     # Step 2: Move forward to cube
     print("\n--- Step 2: Forward ---")
-    grasp_pos = np.array([cube_x, cube_y + y_offset, cube_z + z_offset])
+    grasp_pos = np.array([cube_x, cube_y, cube_z])
     print(f"Grasp target: {grasp_pos}")
+
     for step in range(300):
-        ctrl = ik.step_toward_target(grasp_pos, gripper_action=1.0, gain=0.5)
-        ctrl[4] = np.pi / 2
+        ctrl = ik.step_toward_target(
+            grasp_pos,
+            gripper_action=1.0,
+            gain=0.5,
+            target_quat=target_quat,
+            orientation_weight=0.5
+        )
         data.ctrl[:] = ctrl
         mujoco.mj_step(model, data)
         viewer.sync()
         time.sleep(0.01)
 
-    print(f"TCP: {ik.get_ee_position()}")
-    print(f"Cube: {data.qpos[cube_qpos_addr:cube_qpos_addr+3]}")
+    tcp = ik.get_ee_position()
+    f28 = data.geom_xpos[28]
+    f30 = data.geom_xpos[30]
+    finger_mid = (f28 + f30) / 2
+    cube_pos = data.qpos[cube_qpos_addr:cube_qpos_addr+3]
+    print(f"TCP: {tcp}")
+    print(f"Finger mid: {finger_mid}")
+    print(f"Cube: {cube_pos}")
+    print(f"Finger mid Z vs Cube Z: {finger_mid[2]:.4f} vs {cube_pos[2]:.4f}")
 
-    # Step 3: Close gripper - wait until fully closed
+    # Step 3: Close gripper
     print("\n--- Step 3: Close ---")
     gripper_joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "gripper")
     gripper_qpos_addr = model.jnt_qposadr[gripper_joint_id]
 
-    for step in range(300):  # More steps to fully close
-        ctrl = ik.step_toward_target(grasp_pos, gripper_action=-1.0, gain=0.5)
-        ctrl[4] = np.pi / 2
+    for step in range(300):
+        ctrl = ik.step_toward_target(
+            grasp_pos,
+            gripper_action=-1.0,
+            gain=0.5,
+            target_quat=target_quat,
+            orientation_weight=0.5
+        )
         data.ctrl[:] = ctrl
         mujoco.mj_step(model, data)
         viewer.sync()
@@ -110,10 +145,15 @@ with mujoco.viewer.launch_passive(model, data) as viewer:
 
     # Step 4: Lift
     print("\n--- Step 4: Lift ---")
-    lift_pos = np.array([cube_x, cube_y + y_offset, 0.10])
+    lift_pos = np.array([cube_x, cube_y, 0.10])
     for step in range(100):
-        ctrl = ik.step_toward_target(lift_pos, gripper_action=-1.0, gain=0.5)
-        ctrl[4] = np.pi / 2
+        ctrl = ik.step_toward_target(
+            lift_pos,
+            gripper_action=-1.0,
+            gain=0.5,
+            target_quat=target_quat,
+            orientation_weight=0.5
+        )
         data.ctrl[:] = ctrl
         mujoco.mj_step(model, data)
         viewer.sync()

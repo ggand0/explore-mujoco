@@ -56,16 +56,57 @@ class IKController:
         """Get current end-effector orientation as rotation matrix."""
         return self.data.site_xmat[self.ee_site_id].reshape(3, 3).copy()
 
+    def _quat_to_mat(self, quat: np.ndarray) -> np.ndarray:
+        """Convert quaternion (w, x, y, z) to 3x3 rotation matrix."""
+        w, x, y, z = quat
+        return np.array([
+            [1 - 2*(y*y + z*z), 2*(x*y - w*z), 2*(x*z + w*y)],
+            [2*(x*y + w*z), 1 - 2*(x*x + z*z), 2*(y*z - w*x)],
+            [2*(x*z - w*y), 2*(y*z + w*x), 1 - 2*(x*x + y*y)]
+        ])
+
+    def _orientation_error(self, target_mat: np.ndarray, current_mat: np.ndarray) -> np.ndarray:
+        """Compute orientation error as axis-angle vector.
+
+        Returns a 3D vector whose direction is the rotation axis and
+        magnitude is the rotation angle (in radians).
+        """
+        # Relative rotation: R_error = R_target @ R_current^T
+        R_error = target_mat @ current_mat.T
+
+        # Convert to axis-angle using Rodrigues formula
+        # trace(R) = 1 + 2*cos(theta)
+        trace = np.trace(R_error)
+        cos_theta = (trace - 1) / 2
+        cos_theta = np.clip(cos_theta, -1, 1)
+        theta = np.arccos(cos_theta)
+
+        if theta < 1e-6:
+            return np.zeros(3)
+
+        # axis = (R - R^T) / (2*sin(theta)) as skew-symmetric
+        axis = np.array([
+            R_error[2, 1] - R_error[1, 2],
+            R_error[0, 2] - R_error[2, 0],
+            R_error[1, 0] - R_error[0, 1]
+        ]) / (2 * np.sin(theta))
+
+        return axis * theta
+
     def compute_joint_velocities(
         self,
         target_pos: np.ndarray,
         target_quat: np.ndarray | None = None,
+        orientation_weight: float = 1.0,
+        locked_joints: list[int] | None = None,
     ) -> np.ndarray:
         """Compute joint velocities to move end-effector toward target.
 
         Args:
             target_pos: Target position (3,)
-            target_quat: Target orientation as quaternion (4,), optional
+            target_quat: Target orientation as quaternion (w,x,y,z), optional
+            orientation_weight: Weight for orientation error vs position error
+            locked_joints: List of joint indices (0-4) to exclude from IK
 
         Returns:
             Joint velocities (n_arm_joints,)
@@ -83,27 +124,50 @@ class IKController:
             self.ee_site_id
         )
 
-        # Use only arm joints (first 5), not gripper
-        J = self.jacp[:, :self.n_arm_joints]
+        # Determine which joints to use
+        if locked_joints is None:
+            active_joints = list(range(self.n_arm_joints))
+        else:
+            active_joints = [i for i in range(self.n_arm_joints) if i not in locked_joints]
+
+        n_active = len(active_joints)
+
+        # Use only active joints
+        Jp = self.jacp[:, active_joints]
+        Jr = self.jacr[:, active_joints]
 
         if target_quat is not None:
-            # Include orientation error (simplified - just position for now)
-            # TODO: Add orientation control if needed
-            pass
+            # Combined position + orientation IK
+            target_mat = self._quat_to_mat(target_quat)
+            current_mat = self.get_ee_orientation()
+            ori_error = self._orientation_error(target_mat, current_mat) * orientation_weight
+
+            # Stack position and orientation
+            error = np.concatenate([pos_error, ori_error])
+            J = np.vstack([Jp, Jr])
+        else:
+            # Position-only IK
+            error = pos_error
+            J = Jp
 
         # Damped least-squares pseudoinverse: (J^T J + λ²I)^-1 J^T
         # More stable than pure pseudoinverse near singularities
         JTJ = J.T @ J
-        damping_matrix = self.damping**2 * np.eye(self.n_arm_joints)
+        damping_matrix = self.damping**2 * np.eye(n_active)
 
         try:
-            dq = np.linalg.solve(JTJ + damping_matrix, J.T @ pos_error)
+            dq_active = np.linalg.solve(JTJ + damping_matrix, J.T @ error)
         except np.linalg.LinAlgError:
             # Fallback to pseudoinverse if solve fails
-            dq = np.linalg.pinv(J) @ pos_error
+            dq_active = np.linalg.pinv(J) @ error
 
         # Clamp to max velocity
-        dq = np.clip(dq, -self.max_dq, self.max_dq)
+        dq_active = np.clip(dq_active, -self.max_dq, self.max_dq)
+
+        # Map back to full joint vector
+        dq = np.zeros(self.n_arm_joints)
+        for i, joint_idx in enumerate(active_joints):
+            dq[joint_idx] = dq_active[i]
 
         return dq
 
@@ -112,19 +176,25 @@ class IKController:
         target_pos: np.ndarray,
         gripper_action: float = 0.0,
         gain: float = 1.0,
+        target_quat: np.ndarray | None = None,
+        orientation_weight: float = 1.0,
+        locked_joints: list[int] | None = None,
     ) -> np.ndarray:
-        """Compute control signal to move toward target position.
+        """Compute control signal to move toward target position and orientation.
 
         Args:
             target_pos: Target end-effector position (3,)
             gripper_action: Gripper control (-1 to 1, mapped to control range)
             gain: Proportional gain for velocity
+            target_quat: Target orientation as quaternion (w,x,y,z), optional
+            orientation_weight: Weight for orientation error vs position error
+            locked_joints: List of joint indices (0-4) to exclude from IK
 
         Returns:
             Full control vector (6,) for all actuators
         """
         # Compute arm joint velocities
-        dq = self.compute_joint_velocities(target_pos)
+        dq = self.compute_joint_velocities(target_pos, target_quat, orientation_weight, locked_joints)
         dq *= gain
 
         # Current arm joint positions
