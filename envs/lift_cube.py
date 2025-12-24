@@ -45,6 +45,7 @@ class LiftCubeCartesianEnv(gym.Env):
         reward_type: str = "dense",
         reward_version: str = "v7",
         curriculum_stage: int = 0,  # 0=normal, 1=cube in gripper lifted, 2=cube in gripper on table, 3=gripper near cube
+        lock_wrist: bool = False,  # Lock wrist joints for stable grasping
     ):
         super().__init__()
 
@@ -56,17 +57,20 @@ class LiftCubeCartesianEnv(gym.Env):
         self.reward_type = reward_type
         self.reward_version = reward_version
         self.curriculum_stage = curriculum_stage
+        self.lock_wrist = lock_wrist
         self._step_count = 0
         self._hold_count = 0
         self._was_grasping = False  # Track if we had grasp in previous step (for drop penalty)
+        self._reset_gripper_action = None  # Gripper action used at reset (for curriculum)
 
         # Load model
         scene_path = Path(__file__).parent.parent / "SO-ARM100/Simulation/SO101/lift_cube_scene.xml"
         self.model = mujoco.MjModel.from_xml_path(str(scene_path))
         self.data = mujoco.MjData(self.model)
 
-        # Initialize IK controller
-        self.ik = IKController(self.model, self.data)
+        # Initialize IK controller with gripperframe (TCP)
+        # For grasping, we use offset compensation: target = finger_target + (TCP - finger_mid)
+        self.ik = IKController(self.model, self.data, end_effector_site="gripperframe")
 
         # Joint info
         self.n_joints = 6
@@ -245,57 +249,99 @@ class LiftCubeCartesianEnv(gym.Env):
 
         return self._get_obs(), self._get_info()
 
+    def _get_finger_mid(self) -> np.ndarray:
+        """Get midpoint between gripper fingers."""
+        f28 = self.data.geom_xpos[28]
+        f30 = self.data.geom_xpos[30]
+        return (f28 + f30) / 2
+
+    def _get_cube_contacts(self, cube_geom_id: int) -> list[int]:
+        """Get list of geom IDs in contact with cube."""
+        contacts = []
+        for i in range(self.data.ncon):
+            g1, g2 = self.data.contact[i].geom1, self.data.contact[i].geom2
+            if g1 == cube_geom_id or g2 == cube_geom_id:
+                other = g2 if g1 == cube_geom_id else g1
+                contacts.append(other)
+        return contacts
+
     def _reset_with_cube_in_gripper(self, cube_qpos_addr: int, lift_height: float):
         """Reset with cube grasped in gripper at specified height.
 
-        Pre-rotates wrist_roll by 90 degrees so fingers are horizontal,
-        then uses IK to approach and grasp the cube from the side.
+        Uses top-down approach with locked wrist joints and contact-based
+        grasp detection for reliable grasping.
         """
         # Randomize cube position slightly
         if self.np_random is not None:
-            cube_x = 0.40 + self.np_random.uniform(-0.02, 0.02)
-            cube_y = -0.10 + self.np_random.uniform(-0.02, 0.02)
+            cube_x = 0.32 + self.np_random.uniform(-0.02, 0.02)
+            cube_y = 0.0 + self.np_random.uniform(-0.02, 0.02)
         else:
-            cube_x, cube_y = 0.40, -0.10
+            cube_x, cube_y = 0.32, 0.0
+
+        cube_z = 0.015
 
         # Place cube on table
-        self.data.qpos[cube_qpos_addr : cube_qpos_addr + 3] = [cube_x, cube_y, 0.015]
+        self.data.qpos[cube_qpos_addr : cube_qpos_addr + 3] = [cube_x, cube_y, cube_z]
         self.data.qpos[cube_qpos_addr + 3 : cube_qpos_addr + 7] = [1, 0, 0, 0]
 
-        # Pre-rotate wrist_roll by 90 degrees so fingers are horizontal (Y-axis separation)
-        # This allows horizontal approach to achieve a proper grasp
-        self.data.qpos[4] = np.pi / 2  # wrist_roll = 90 degrees
-        self.data.ctrl[4] = np.pi / 2  # maintain wrist_roll position
+        # Pre-rotate wrist for top-down orientation
+        self.data.qpos[4] = np.pi / 2  # wrist_roll = 90 degrees (horizontal fingers)
+        self.data.ctrl[4] = np.pi / 2
         mujoco.mj_forward(self.model, self.data)
 
-        # Step 1: Move gripper to cube height, offset in X
-        approach_pos = np.array([cube_x - 0.05, cube_y, 0.025])
-        for _ in range(100):
-            ctrl = self.ik.step_toward_target(approach_pos, gripper_action=1.0, gain=0.5)
-            ctrl[4] = np.pi / 2  # maintain wrist_roll
+        # Get cube geom ID for contact detection
+        cube_geom_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "cube_geom")
+
+        # Step 1: Approach - position graspframe (finger midpoint) slightly before cube
+        # graspframe is already at finger midpoint, so no offset needed
+        for _ in range(400):
+            target = np.array([cube_x - 0.03, cube_y, cube_z])
+            ctrl = self.ik.step_toward_target(target, gripper_action=1.0, gain=0.5, locked_joints=[3, 4])
+            ctrl[3] = 1.65  # wrist_flex points down
+            ctrl[4] = np.pi / 2
             self.data.ctrl[:] = ctrl
             mujoco.mj_step(self.model, self.data)
 
-        # Step 2: Move forward to grasp position
-        grasp_pos = np.array([cube_x, cube_y, 0.025])
-        for _ in range(100):
-            ctrl = self.ik.step_toward_target(grasp_pos, gripper_action=1.0, gain=0.5)
-            ctrl[4] = np.pi / 2  # maintain wrist_roll
+        # Step 2: Move forward to cube position
+        for _ in range(400):
+            target = np.array([cube_x, cube_y, cube_z])
+            ctrl = self.ik.step_toward_target(target, gripper_action=1.0, gain=0.5, locked_joints=[3, 4])
+            ctrl[3] = 1.65
+            ctrl[4] = np.pi / 2
             self.data.ctrl[:] = ctrl
             mujoco.mj_step(self.model, self.data)
 
-        # Step 3: Close gripper
-        for _ in range(100):
-            ctrl = self.ik.step_toward_target(grasp_pos, gripper_action=-1.0, gain=0.5)
-            ctrl[4] = np.pi / 2  # maintain wrist_roll
+        # Step 3: Close gripper until both fingers contact cube
+        grasp_gripper_action = 1.0
+        for step in range(800):
+            contacts = self._get_cube_contacts(cube_geom_id)
+            has_27_28 = 27 in contacts or 28 in contacts
+            has_29_30 = 29 in contacts or 30 in contacts
+
+            # Ramp gripper closed
+            t = min(step / 600, 1.0)
+            gripper_action = 1.0 - 2.0 * t
+
+            target = np.array([cube_x, cube_y, cube_z])
+            ctrl = self.ik.step_toward_target(target, gripper_action=gripper_action, gain=0.5, locked_joints=[3, 4])
+            ctrl[3] = 1.65
+            ctrl[4] = np.pi / 2
             self.data.ctrl[:] = ctrl
             mujoco.mj_step(self.model, self.data)
 
-        # Step 4: Lift to target height
-        lift_pos = np.array([cube_x, cube_y, lift_height])
-        for _ in range(100):
-            ctrl = self.ik.step_toward_target(lift_pos, gripper_action=-1.0, gain=0.5)
-            ctrl[4] = np.pi / 2  # maintain wrist_roll
+            # Stop when grasp achieved and gripper is closed enough
+            if has_27_28 and has_29_30 and self._get_gripper_state() < 0.25:
+                grasp_gripper_action = gripper_action
+                break
+
+        # Store the gripper action for curriculum learning
+        self._reset_gripper_action = grasp_gripper_action
+
+        # Step 4: Settle - maintain the exact gripper action that achieved grasp
+        for _ in range(50):
+            ctrl = self.ik.step_toward_target(target, gripper_action=grasp_gripper_action, gain=0.5, locked_joints=[3, 4])
+            ctrl[3] = 1.65
+            ctrl[4] = np.pi / 2
             self.data.ctrl[:] = ctrl
             mujoco.mj_step(self.model, self.data)
 
@@ -337,11 +383,30 @@ class LiftCubeCartesianEnv(gym.Env):
         self._target_ee_pos[2] = np.clip(self._target_ee_pos[2], 0.01, 0.4)
 
         # Use IK to compute joint controls
-        ctrl = self.ik.step_toward_target(
-            self._target_ee_pos,
-            gripper_action=gripper_action,
-            gain=0.5,
-        )
+        if self.lock_wrist:
+            # For curriculum learning with locked wrist, maintain the gripper action from reset
+            # This prevents oscillation from aggressive gripper closing
+            if self._reset_gripper_action is not None and gripper_action < 0:
+                # Agent wants to close - use the stable reset gripper action
+                stable_gripper = self._reset_gripper_action
+            else:
+                stable_gripper = gripper_action
+
+            # Lock wrist joints for stable grasping orientation
+            ctrl = self.ik.step_toward_target(
+                self._target_ee_pos,
+                gripper_action=stable_gripper,
+                gain=0.5,
+                locked_joints=[3, 4],
+            )
+            ctrl[3] = 1.65  # wrist_flex points down
+            ctrl[4] = np.pi / 2  # wrist_roll horizontal
+        else:
+            ctrl = self.ik.step_toward_target(
+                self._target_ee_pos,
+                gripper_action=gripper_action,
+                gain=0.5,
+            )
 
         # Apply control and step simulation multiple times for stability
         self.data.ctrl[:] = ctrl
@@ -628,24 +693,114 @@ class LiftCubeCartesianEnv(gym.Env):
 
         return reward
 
-    def render(self, camera: str = "sideview") -> np.ndarray | None:
+    def _reward_v9(self, info: dict[str, Any], was_grasping: bool = False) -> float:
+        """V9: V8 + continuous lift gradient. For curriculum learning.
+
+        Adds smooth reward for lifting higher while grasping, instead of
+        just binary threshold at z=0.02.
+        """
+        reward = 0.0
+        cube_z = info["cube_z"]
+        gripper_to_cube = info["gripper_to_cube"]
+        is_grasping = info["is_grasping"]
+
+        # Reach reward (less important for curriculum where we start grasped)
+        reach_reward = 1.0 - np.tanh(10.0 * gripper_to_cube)
+        reward += reach_reward
+
+        # Push-down penalty
+        if cube_z < 0.01:
+            push_penalty = (0.01 - cube_z) * 50.0
+            reward -= push_penalty
+
+        # Drop penalty: penalize losing grasp after having it
+        if was_grasping and not is_grasping:
+            reward -= 2.0
+
+        # Grasp bonus
+        if is_grasping:
+            reward += 0.25
+
+            # Continuous lift reward when grasping - this is the key addition
+            # Reward proportional to height above table (0.015 is cube resting height)
+            lift_progress = max(0, cube_z - 0.015) / (self.lift_height - 0.015)
+            reward += lift_progress * 2.0  # Up to +2.0 at target height
+
+        # Binary lift bonus (kept for compatibility)
+        if cube_z > 0.02:
+            reward += 1.0
+
+        # Success bonus
+        if info["is_success"]:
+            reward += 10.0
+
+        return reward
+
+    def _reward_v10(self, info: dict[str, Any], was_grasping: bool = False) -> float:
+        """V10: Lift-focused reward for curriculum learning.
+
+        Changes from v9:
+        - No reach reward when grasping (redundant, dominates signal)
+        - Stronger lift gradient (5.0 instead of 2.0)
+        - Makes lifting the dominant reward signal when holding cube
+        """
+        reward = 0.0
+        cube_z = info["cube_z"]
+        gripper_to_cube = info["gripper_to_cube"]
+        is_grasping = info["is_grasping"]
+
+        # Push-down penalty
+        if cube_z < 0.01:
+            push_penalty = (0.01 - cube_z) * 50.0
+            reward -= push_penalty
+
+        # Drop penalty
+        if was_grasping and not is_grasping:
+            reward -= 5.0  # Stronger penalty for dropping
+
+        if is_grasping:
+            # Small grasp maintenance bonus
+            reward += 0.1
+
+            # Lift is the main reward when grasping
+            lift_progress = max(0, cube_z - 0.015) / (self.lift_height - 0.015)
+            reward += lift_progress * 5.0  # Up to +5.0 at target height
+
+        else:
+            # Only use reach reward when not grasping (need to recover)
+            reach_reward = 1.0 - np.tanh(10.0 * gripper_to_cube)
+            reward += reach_reward
+
+        # Success bonus
+        if info["is_success"]:
+            reward += 10.0
+
+        return reward
+
+    def render(self, camera: str = "closeup") -> np.ndarray | None:
         if self.render_mode == "rgb_array":
             if self._renderer is None:
                 self._renderer = mujoco.Renderer(self.model, height=480, width=640)
-            # Map camera names (closeup/wide/wide2 -> sideview/frontview/topview)
-            camera_map = {
-                "closeup": "sideview",
-                "wide": "frontview",
-                "wide2": "topview",
-                "sideview": "sideview",
-                "frontview": "frontview",
-                "topview": "topview",
-            }
-            cam_name = camera_map.get(camera, "sideview")
-            camera_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_CAMERA, cam_name)
-            if camera_id == -1:
-                camera_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_CAMERA, "sideview")
-            self._renderer.update_scene(self.data, camera=camera_id)
+            cam = mujoco.MjvCamera()
+            if camera == "closeup":
+                # Side view close to cube
+                cam.lookat[:] = [0.40, -0.10, 0.03]
+                cam.distance = 0.35
+                cam.azimuth = 90
+                cam.elevation = -15
+            elif camera == "wide":
+                # Diagonal view of arm and cube
+                cam.lookat[:] = [0.25, -0.05, 0.05]
+                cam.distance = 0.8
+                cam.azimuth = 135
+                cam.elevation = -25
+            else:  # "wide2"
+                # Diagonal view from other side
+                cam.lookat[:] = [0.25, -0.05, 0.05]
+                cam.distance = 0.8
+                cam.azimuth = 45
+                cam.elevation = -25
+            self._renderer.update_scene(self.data, camera=cam)
             return self._renderer.render()
         return None
 
