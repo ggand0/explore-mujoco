@@ -25,12 +25,13 @@ env:
   normalize_obs: true
   normalize_reward: true
   max_episode_steps: 100  # Shorter episodes for holding task
-  action_scale: 0.02
+  action_scale: 0.005  # Smaller scale for stable grasping (5mm vs 20mm)
   lift_height: 0.08
   hold_steps: 10
   reward_type: "dense"
-  reward_version: "v8"
-  curriculum_stage: 1  # Start with cube grasped at lift height
+  reward_version: "v10"
+  curriculum_stage: 1  # Start with cube grasped at table level
+  lock_wrist: true  # Lock wrist joints for stable top-down grasp
 
 eval:
   episodes: 10

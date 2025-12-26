@@ -34,6 +34,7 @@ def make_env(env_cfg: dict):
         reward_type=env_cfg.get("reward_type", "dense"),
         reward_version=env_cfg.get("reward_version", "v7"),
         curriculum_stage=env_cfg.get("curriculum_stage", 0),
+        lock_wrist=env_cfg.get("lock_wrist", False),
     )
 
 

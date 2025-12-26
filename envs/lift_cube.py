@@ -292,17 +292,16 @@ class LiftCubeCartesianEnv(gym.Env):
         # Get cube geom ID for contact detection
         cube_geom_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "cube_geom")
 
-        # Step 1: Approach - position graspframe (finger midpoint) slightly before cube
-        # graspframe is already at finger midpoint, so no offset needed
+        # Step 1: Approach from above - position above cube with fingers open
         for _ in range(400):
-            target = np.array([cube_x - 0.03, cube_y, cube_z])
+            target = np.array([cube_x, cube_y, cube_z + 0.05])
             ctrl = self.ik.step_toward_target(target, gripper_action=1.0, gain=0.5, locked_joints=[3, 4])
             ctrl[3] = 1.65  # wrist_flex points down
             ctrl[4] = np.pi / 2
             self.data.ctrl[:] = ctrl
             mujoco.mj_step(self.model, self.data)
 
-        # Step 2: Move forward to cube position
+        # Step 2: Descend to cube level - fingers straddle cube
         for _ in range(400):
             target = np.array([cube_x, cube_y, cube_z])
             ctrl = self.ik.step_toward_target(target, gripper_action=1.0, gain=0.5, locked_joints=[3, 4])
@@ -384,22 +383,21 @@ class LiftCubeCartesianEnv(gym.Env):
 
         # Use IK to compute joint controls
         if self.lock_wrist:
-            # For curriculum learning with locked wrist, maintain the gripper action from reset
-            # This prevents oscillation from aggressive gripper closing
-            if self._reset_gripper_action is not None and gripper_action < 0:
-                # Agent wants to close - use the stable reset gripper action
+            # Lock gripper to reset value - agent only controls XYZ for lifting
+            # This prevents physics issues (can't open with cube in grip, closing launches cube)
+            if self._reset_gripper_action is not None:
                 stable_gripper = self._reset_gripper_action
             else:
                 stable_gripper = gripper_action
 
-            # Lock wrist joints for stable grasping orientation
+            # Lock only wrist_roll (joint 4) for horizontal fingers
+            # Let wrist_flex (joint 3) move for lifting range
             ctrl = self.ik.step_toward_target(
                 self._target_ee_pos,
                 gripper_action=stable_gripper,
                 gain=0.5,
-                locked_joints=[3, 4],
+                locked_joints=[4],
             )
-            ctrl[3] = 1.65  # wrist_flex points down
             ctrl[4] = np.pi / 2  # wrist_roll horizontal
         else:
             ctrl = self.ik.step_toward_target(

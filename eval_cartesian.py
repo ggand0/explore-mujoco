@@ -20,6 +20,10 @@ def main():
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--curriculum-stage", type=int, default=0,
                         help="Curriculum stage (0=normal, 1=grasped lifted, 2=grasped table, 3=near cube)")
+    parser.add_argument("--lock-wrist", action="store_true",
+                        help="Lock wrist joints for stable top-down grasping")
+    parser.add_argument("--action-scale", type=float, default=0.02,
+                        help="Action scale for delta XYZ movements")
     args = parser.parse_args()
 
     # Determine output path - default to model's run directory
@@ -42,6 +46,8 @@ def main():
         render_mode="rgb_array",
         max_episode_steps=200,
         curriculum_stage=args.curriculum_stage,
+        lock_wrist=args.lock_wrist,
+        action_scale=args.action_scale,
     )
     vec_env = DummyVecEnv([lambda: env])
 
